@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Go build and test artifacts
+bin/
+build/
+dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+
+# Local temporary files
+tmp/
+*.log

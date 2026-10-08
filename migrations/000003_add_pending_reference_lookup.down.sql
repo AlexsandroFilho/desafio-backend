@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS wager_transactions_pending_reference_lookup_idx;

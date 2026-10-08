@@ -1,0 +1,92 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: wagerdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wagerdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    image: migrate/migrate:v4.18.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://postgres:postgres@postgres:5432/wagerdb?sslmode=disable
+      - up
+    restart: "no"
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      EAGER_SERVICE_LOADING: "1"
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs list-queues >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  sqs-init:
+    image: localstack/localstack:3.8.1
+    depends_on:
+      localstack:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        DLQ_URL=$$(awslocal --endpoint-url=http://localstack:4566 sqs create-queue \
+          --queue-name wager-transactions-dlq.fifo \
+          --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"true"}' \
+          --query QueueUrl --output text)
+        DLQ_ARN=$$(awslocal --endpoint-url=http://localstack:4566 sqs get-queue-attributes \
+          --queue-url "$$DLQ_URL" \
+          --attribute-names QueueArn \
+          --query Attributes.QueueArn --output text)
+        MAIN_QUEUE_URL=$$(awslocal --endpoint-url=http://localstack:4566 sqs create-queue \
+          --queue-name wager-transactions.fifo \
+          --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"true"}' \
+          --query QueueUrl --output text)
+        REDRIVE_ATTRIBUTES=$$(python3 -c \
+          'import json, sys; print(json.dumps({"RedrivePolicy": json.dumps({"deadLetterTargetArn": sys.argv[1], "maxReceiveCount": "5"})}))' \
+          "$$DLQ_ARN")
+        awslocal --endpoint-url=http://localstack:4566 sqs set-queue-attributes \
+          --queue-url "$$MAIN_QUEUE_URL" \
+          --attributes "$$REDRIVE_ATTRIBUTES"
+        awslocal --endpoint-url=http://localstack:4566 sqs create-queue \
+          --queue-name wager-events.fifo \
+          --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}'
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak/wager-realm.json:/opt/keycloak/data/import/wager-realm.json:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

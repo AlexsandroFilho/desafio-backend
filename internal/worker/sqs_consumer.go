@@ -355,7 +355,9 @@ func validateWagerEnvelope(envelope WagerMessageEnvelope) error {
 func isPermanentWagerError(err error) bool {
 	return errors.Is(err, usecase.ErrIdempotencyConflict) ||
 		errors.Is(err, domain.ErrInvalidWalletAmount) ||
+		errors.Is(err, domain.ErrCurrencyMismatch) ||
 		errors.Is(err, domain.ErrInvalidTransactionKind) ||
+		errors.Is(err, usecase.ErrUnsupportedWagerKind) ||
 		errors.Is(err, repository.ErrInboxHashMismatch)
 }
 

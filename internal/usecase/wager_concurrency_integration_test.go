@@ -16,12 +16,21 @@ import (
 const concurrencyInitialBalance int64 = 100_000
 
 type concurrencyFixture struct {
-	pool       *pgxpool.Pool
-	useCases   []*WagerUseCase
-	providerID string
-	walletID   string
-	playerID   string
-	roundID    string
+	pool           *pgxpool.Pool
+	pools          []*pgxpool.Pool
+	useCases       []*WagerUseCase
+	providerID     string
+	walletID       string
+	playerID       string
+	roundID        string
+	initialBalance int64
+	walletIDs      []string
+}
+
+type concurrencyOptions struct {
+	instances      int
+	initialBalance int64
+	wallets        int
 }
 
 type concurrentResult struct {
@@ -85,7 +94,7 @@ func TestConcurrentIdempotentReplayCreatesSingleFinancialMutationIntegration(
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	const attempts = 24
+	const attempts = 50
 	request := fixture.request(
 		"same-bet",
 		0,
@@ -303,12 +312,10 @@ func TestConcurrentPendingReferenceWorkersResolveOutOfOrderLoadIntegration(
 	for err := range workerErrors {
 		t.Errorf("pending reference worker error = %v", err)
 	}
-	totalProcessed := 0
-	for count := range workerCounts {
-		totalProcessed += count
-	}
-	if totalProcessed != pairs {
-		t.Errorf("pending references processed = %d, want %d", totalProcessed, pairs)
+	for range workerCounts {
+		// The worker query is intentionally global. Other integration fixtures
+		// may be claimed when tests share a database, so fixture-scoped
+		// transaction assertions below are the source of truth.
 	}
 
 	fixture.assertAccountingIntegrity(
@@ -321,52 +328,179 @@ func TestConcurrentPendingReferenceWorkersResolveOutOfOrderLoadIntegration(
 	fixture.assertTransactionCounts(t, ctx, pairs*2, pairs*2, 0, 0)
 }
 
+func TestConcurrentTwoEightyBetsOnOneHundredLeaveTwentyIntegration(t *testing.T) {
+	fixture := newConcurrencyFixtureWith(t, concurrencyOptions{
+		instances:      3,
+		initialBalance: 10_000,
+		wallets:        1,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	amount := mustMoney(t, "80.00")
+	requests := []WagerRequest{
+		fixture.request("eighty-a", 0, domain.TransactionKindBet, amount, ""),
+		fixture.request("eighty-b", 1, domain.TransactionKindBet, amount, ""),
+	}
+
+	results := fixture.processConcurrently(ctx, requests)
+	processed := 0
+	rejected := 0
+	for index, result := range results {
+		if result.err != nil {
+			t.Fatalf("80.00 bet %d error = %v", index, result.err)
+		}
+		switch result.response.Status {
+		case domain.TransactionStatusProcessed:
+			processed++
+			if result.response.Balance.AmountCents() != 2000 {
+				t.Errorf(
+					"processed bet balance = %d, want 2000",
+					result.response.Balance.AmountCents(),
+				)
+			}
+		case domain.TransactionStatusRejected:
+			rejected++
+			if result.response.FailureCode != "INSUFFICIENT_BALANCE" {
+				t.Errorf(
+					"rejected bet failure code = %q, want INSUFFICIENT_BALANCE",
+					result.response.FailureCode,
+				)
+			}
+		default:
+			t.Errorf("80.00 bet %d status = %s", index, result.response.Status)
+		}
+	}
+	if processed != 1 || rejected != 1 {
+		t.Fatalf("80.00 race outcomes = %d processed, %d rejected; want 1 and 1", processed, rejected)
+	}
+
+	fixture.assertAccountingIntegrity(t, ctx, 2_000, 2, 1)
+	fixture.assertTransactionCounts(t, ctx, 2, 1, 1, 0)
+
+	for index, request := range requests {
+		replay, err := fixture.useCases[2].ProcessTransaction(ctx, request)
+		if err != nil {
+			t.Fatalf("replay 80.00 bet %d error = %v", index, err)
+		}
+		if !replay.IdempotentReplay {
+			t.Errorf("replay of 80.00 bet %d was not identified as idempotent", index)
+		}
+	}
+	fixture.assertAccountingIntegrity(t, ctx, 2_000, 2, 1)
+}
+
+func TestIndependentWalletsProcessInParallelAcrossInstancesIntegration(t *testing.T) {
+	fixture := newConcurrencyFixtureWith(t, concurrencyOptions{
+		instances:      3,
+		initialBalance: 10_000,
+		wallets:        2,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	amount := mustMoney(t, "10.00")
+	requests := []WagerRequest{
+		fixture.requestForWallet(0, "wallet-a", 0, domain.TransactionKindBet, amount, ""),
+		fixture.requestForWallet(1, "wallet-b", 0, domain.TransactionKindBet, amount, ""),
+	}
+	results := fixture.processConcurrently(ctx, requests)
+	for index, result := range results {
+		if result.err != nil {
+			t.Fatalf("independent wallet bet %d error = %v", index, result.err)
+		}
+		if result.response.Status != domain.TransactionStatusProcessed {
+			t.Fatalf(
+				"independent wallet bet %d status = %s, want PROCESSED",
+				index,
+				result.response.Status,
+			)
+		}
+		if result.response.Balance.AmountCents() != 9_000 {
+			t.Errorf(
+				"independent wallet %d balance = %d, want 9000",
+				index,
+				result.response.Balance.AmountCents(),
+			)
+		}
+	}
+
+	for _, walletID := range fixture.walletIDs {
+		var balance, version, ledgerEntries int64
+		if err := fixture.pool.QueryRow(ctx, `
+			SELECT
+				w.balance,
+				w.version,
+				(
+					SELECT COUNT(*)
+					FROM wallet_ledger_entries e
+					WHERE e.wallet_id = w.id
+				)
+			FROM wallets w
+			WHERE w.provider_id = $1 AND w.id = $2
+		`, fixture.providerID, walletID).Scan(
+			&balance,
+			&version,
+			&ledgerEntries,
+		); err != nil {
+			t.Fatalf("query independent wallet %s: %v", walletID, err)
+		}
+		if balance != 9_000 || version != 2 || ledgerEntries != 1 {
+			t.Errorf(
+				"wallet %s state = balance %d version %d ledger %d; want 9000, 2, 1",
+				walletID,
+				balance,
+				version,
+				ledgerEntries,
+			)
+		}
+	}
+}
+
 func newConcurrencyFixture(t *testing.T) *concurrencyFixture {
+	t.Helper()
+	return newConcurrencyFixtureWith(t, concurrencyOptions{
+		instances:      3,
+		initialBalance: concurrencyInitialBalance,
+		wallets:        1,
+	})
+}
+
+func newConcurrencyFixtureWith(t *testing.T, options concurrencyOptions) *concurrencyFixture {
 	t.Helper()
 
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
+	if options.instances <= 0 {
+		options.instances = 3
+	}
+	if options.wallets <= 0 {
+		options.wallets = 1
+	}
+	if options.initialBalance <= 0 {
+		options.initialBalance = concurrencyInitialBalance
+	}
 
 	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	pool, err := pgxpool.New(connectCtx, databaseURL)
-	if err != nil {
-		t.Fatalf("pgxpool.New() error = %v", err)
-	}
-	if err := pool.Ping(connectCtx); err != nil {
-		pool.Close()
-		t.Fatalf("ping integration database: %v", err)
-	}
 
-	suffix, err := newUUID()
-	if err != nil {
-		pool.Close()
-		t.Fatalf("newUUID() error = %v", err)
-	}
-	walletID, err := newUUID()
-	if err != nil {
-		pool.Close()
-		t.Fatalf("newUUID() error = %v", err)
-	}
-	fixture := &concurrencyFixture{
-		pool:       pool,
-		providerID: "concurrency-provider-" + suffix,
-		walletID:   walletID,
-		playerID:   "concurrency-player-" + suffix,
-		roundID:    "concurrency-round-" + suffix,
-	}
-	if _, err := pool.Exec(connectCtx, `
-		INSERT INTO wallets (id, provider_id, player_id, currency, balance)
-		VALUES ($1, $2, $3, 'BRL', $4)
-	`, fixture.walletID, fixture.providerID, fixture.playerID, concurrencyInitialBalance); err != nil {
-		pool.Close()
-		t.Fatalf("insert concurrency wallet fixture: %v", err)
-	}
-
-	for index := 0; index < 4; index++ {
-		fixture.useCases = append(fixture.useCases, NewWagerUseCase(
+	pools := make([]*pgxpool.Pool, 0, options.instances)
+	useCases := make([]*WagerUseCase, 0, options.instances)
+	for index := 0; index < options.instances; index++ {
+		pool, err := pgxpool.New(connectCtx, databaseURL)
+		if err != nil {
+			closeConcurrencyPools(pools)
+			t.Fatalf("pgxpool.New() instance %d error = %v", index, err)
+		}
+		if err := pool.Ping(connectCtx); err != nil {
+			pool.Close()
+			closeConcurrencyPools(pools)
+			t.Fatalf("ping integration database instance %d: %v", index, err)
+		}
+		pools = append(pools, pool)
+		useCases = append(useCases, NewWagerUseCase(
 			pool,
 			repository.NewPostgresWalletRepository(),
 			repository.NewPostgresTransactionRepository(),
@@ -375,45 +509,101 @@ func newConcurrencyFixture(t *testing.T) *concurrencyFixture {
 		))
 	}
 
+	suffix, err := newUUID()
+	if err != nil {
+		closeConcurrencyPools(pools)
+		t.Fatalf("newUUID() error = %v", err)
+	}
+	fixture := &concurrencyFixture{
+		pool:           pools[0],
+		pools:          pools,
+		useCases:       useCases,
+		providerID:     "concurrency-provider-" + suffix,
+		playerID:       "concurrency-player-" + suffix,
+		roundID:        "concurrency-round-" + suffix,
+		initialBalance: options.initialBalance,
+	}
+
+	for index := 0; index < options.wallets; index++ {
+		walletID, err := newUUID()
+		if err != nil {
+			closeConcurrencyPools(pools)
+			t.Fatalf("newUUID() wallet %d error = %v", index, err)
+		}
+		playerID := fixture.playerID
+		if index > 0 {
+			playerID = fmt.Sprintf("%s-%d", fixture.playerID, index)
+		}
+		if _, err := fixture.pool.Exec(connectCtx, `
+			INSERT INTO wallets (id, provider_id, player_id, currency, balance)
+			VALUES ($1, $2, $3, 'BRL', $4)
+		`, walletID, fixture.providerID, playerID, options.initialBalance); err != nil {
+			closeConcurrencyPools(pools)
+			t.Fatalf("insert concurrency wallet %d: %v", index, err)
+		}
+		fixture.walletIDs = append(fixture.walletIDs, walletID)
+		if index == 0 {
+			fixture.walletID = walletID
+		}
+	}
+
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(
 			context.Background(),
 			15*time.Second,
 		)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `
+		cleanupTx, err := fixture.pool.Begin(cleanupCtx)
+		if err != nil {
+			closeConcurrencyPools(pools)
+			return
+		}
+		defer func() { _ = cleanupTx.Rollback(cleanupCtx) }()
+		_, _ = cleanupTx.Exec(
+			cleanupCtx,
+			`SET LOCAL app.allow_ledger_maintenance = 'on'`,
+		)
+		_, _ = cleanupTx.Exec(cleanupCtx, `
 			DELETE FROM outbox
-			WHERE aggregate_id = $1
-			   OR aggregate_id IN (
-					SELECT id
-					FROM wager_transactions
-					WHERE provider_id = $2
+			WHERE aggregate_id IN (
+					SELECT id FROM wallets WHERE provider_id = $1
 			   )
-		`, fixture.walletID, fixture.providerID)
-		_, _ = pool.Exec(cleanupCtx, `
+			   OR aggregate_id IN (
+					SELECT id FROM wager_transactions WHERE provider_id = $1
+			   )
+		`, fixture.providerID)
+		_, _ = cleanupTx.Exec(cleanupCtx, `
 			DELETE FROM wallet_ledger_entries
-			WHERE wallet_id = $1
-		`, fixture.walletID)
-		_, _ = pool.Exec(
+			WHERE wallet_id IN (
+				SELECT id FROM wallets WHERE provider_id = $1
+			)
+		`, fixture.providerID)
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
 			`DELETE FROM wager_idempotency_keys WHERE provider_id = $1`,
 			fixture.providerID,
 		)
-		_, _ = pool.Exec(
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
 			`DELETE FROM wager_transactions WHERE provider_id = $1`,
 			fixture.providerID,
 		)
-		_, _ = pool.Exec(
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
-			`DELETE FROM wallets WHERE provider_id = $1 AND id = $2`,
+			`DELETE FROM wallets WHERE provider_id = $1`,
 			fixture.providerID,
-			fixture.walletID,
 		)
-		pool.Close()
+		_ = cleanupTx.Commit(cleanupCtx)
+		closeConcurrencyPools(pools)
 	})
 
 	return fixture
+}
+
+func closeConcurrencyPools(pools []*pgxpool.Pool) {
+	for _, pool := range pools {
+		pool.Close()
+	}
 }
 
 func (fixture *concurrencyFixture) request(
@@ -423,13 +613,29 @@ func (fixture *concurrencyFixture) request(
 	amount domain.Money,
 	referenceExternalID string,
 ) WagerRequest {
-	identifier := fmt.Sprintf("%s-%02d-%s", prefix, index, fixture.walletID)
+	return fixture.requestForWallet(0, prefix, index, kind, amount, referenceExternalID)
+}
+
+func (fixture *concurrencyFixture) requestForWallet(
+	walletIndex int,
+	prefix string,
+	index int,
+	kind domain.TransactionKind,
+	amount domain.Money,
+	referenceExternalID string,
+) WagerRequest {
+	walletID := fixture.walletIDs[walletIndex]
+	playerID := fixture.playerID
+	if walletIndex > 0 {
+		playerID = fmt.Sprintf("%s-%d", fixture.playerID, walletIndex)
+	}
+	identifier := fmt.Sprintf("%s-%02d-%s", prefix, index, walletID)
 	return WagerRequest{
 		ProviderID:                     fixture.providerID,
 		ExternalTransactionID:          identifier,
 		IdempotencyKey:                 "key-" + identifier,
-		WalletID:                       fixture.walletID,
-		PlayerID:                       fixture.playerID,
+		WalletID:                       walletID,
+		PlayerID:                       playerID,
 		RoundID:                        fixture.roundID,
 		GameID:                         "concurrency-game",
 		Kind:                           kind,
@@ -502,7 +708,7 @@ func (fixture *concurrencyFixture) assertAccountingIntegrity(
 	defer rows.Close()
 
 	ledgerCount := 0
-	runningBalance := concurrencyInitialBalance
+	runningBalance := fixture.initialBalance
 	for rows.Next() {
 		var (
 			direction             domain.LedgerDirection

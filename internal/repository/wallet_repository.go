@@ -8,15 +8,23 @@ import (
 
 	"alexsandro-filho/desafio-backend/internal/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
 	ErrWalletNotFound       = errors.New("wallet not found")
+	ErrWalletAlreadyExists  = errors.New("wallet already exists for provider, player, and currency")
 	ErrWalletUpdateConflict = errors.New("wallet update conflict")
 )
 
 type WalletRepository interface {
 	Create(ctx context.Context, tx pgx.Tx, providerID string, wallet *domain.Wallet) error
+	Get(
+		ctx context.Context,
+		tx pgx.Tx,
+		providerID string,
+		walletID string,
+	) (*domain.Wallet, error)
 	GetForUpdate(
 		ctx context.Context,
 		tx pgx.Tx,
@@ -70,10 +78,33 @@ func (r *PostgresWalletRepository) Create(
 		wallet.UpdatedAt(),
 	)
 	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return ErrWalletAlreadyExists
+		}
 		return fmt.Errorf("create wallet: %w", err)
 	}
 
 	return nil
+}
+
+func (r *PostgresWalletRepository) Get(
+	ctx context.Context,
+	tx pgx.Tx,
+	providerID string,
+	walletID string,
+) (*domain.Wallet, error) {
+	const query = `
+		SELECT id, player_id, currency, balance, version, created_at, updated_at
+		FROM wallets
+		WHERE provider_id = $1
+		  AND id = $2
+	`
+
+	return scanWallet(
+		tx.QueryRow(ctx, query, providerID, walletID),
+		"get wallet",
+	)
 }
 
 func (r *PostgresWalletRepository) GetForUpdate(
@@ -90,6 +121,13 @@ func (r *PostgresWalletRepository) GetForUpdate(
 		FOR UPDATE
 	`
 
+	return scanWallet(
+		tx.QueryRow(ctx, query, providerID, walletID),
+		"get wallet for update",
+	)
+}
+
+func scanWallet(row pgx.Row, operation string) (*domain.Wallet, error) {
 	var (
 		id        string
 		playerID  string
@@ -100,7 +138,7 @@ func (r *PostgresWalletRepository) GetForUpdate(
 		updatedAt time.Time
 	)
 
-	err := tx.QueryRow(ctx, query, providerID, walletID).Scan(
+	err := row.Scan(
 		&id,
 		&playerID,
 		&currency,
@@ -113,7 +151,7 @@ func (r *PostgresWalletRepository) GetForUpdate(
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrWalletNotFound
 		}
-		return nil, fmt.Errorf("get wallet for update: %w", err)
+		return nil, fmt.Errorf("%s: %w", operation, err)
 	}
 
 	money, err := moneyFromCents(balance, currency)

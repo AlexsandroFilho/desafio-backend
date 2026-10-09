@@ -31,6 +31,9 @@ O código é separado em:
 - `internal/observability`: métricas Prometheus e logs HTTP.
 - `internal/app`: configuração, injeção de dependências com Fx e lifecycle.
 
+As decisões de invariantes, locks, idempotência, outbox e shutdown estão
+em [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Garantias financeiras
 
 - Valores monetários são armazenados em centavos (`BIGINT`), sem ponto
@@ -44,6 +47,8 @@ O código é separado em:
 - Apenas uma reversão processada é permitida para cada transação original.
 - Reversões recebidas fora de ordem ficam em `PENDING_REFERENCE` e são
   resolvidas por worker com `FOR UPDATE SKIP LOCKED`.
+- Referências ausentes usam backoff exponencial de 1 segundo até 1 hora e são
+  rejeitadas com `REFERENCE_NOT_FOUND` após 10 tentativas ou 24 horas.
 - Carteiras e transações são isoladas pelo `providerId` autenticado.
 - Eventos são publicados pelo padrão transactional outbox, com retry
   exponencial e deduplicação FIFO.
@@ -67,18 +72,29 @@ No PowerShell:
 Copy-Item .env.example .env
 ```
 
-Suba PostgreSQL, migrations, LocalStack/SQS e Keycloak:
+Suba PostgreSQL, migrations, LocalStack/SQS, Keycloak e a API:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 docker compose ps
 ```
 
 O container `migrate` e o `sqs-init` terminam após concluírem sua tarefa. Isso é
-esperado. Depois, execute a aplicação:
+esperado. A API sobe no serviço `api`, construído pelo `Dockerfile` multi-stage
+(`golang:1.27.1` → distroless).
+
+Para desenvolver a API no host, suba só a infraestrutura e execute o binário
+local:
 
 ```bash
+docker compose up -d postgres migrate localstack sqs-init keycloak
 go run ./cmd/api
+```
+
+Imagem isolada, sem Compose:
+
+```bash
+docker build -t wager-transaction-service:local .
 ```
 
 Serviços locais:
@@ -121,6 +137,7 @@ Endpoints autenticados:
 - `POST /wallets/{walletId}/reconciliation`
 - `POST /wagering/transactions`
 - `GET /wagering/transactions/{transactionId}`
+- `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}`
 
 ### Criar carteira
 
@@ -171,6 +188,10 @@ Para `REFUND` ou `ROLLBACK`, envie também:
 ```
 
 `LOSS` representa apenas o encerramento sem prêmio e exige valor `0.00`.
+
+A reconciliação lê carteira e ledger no mesmo snapshot `REPEATABLE READ` e
+retorna saldo armazenado, saldo calculado, diferença, consistência e quantidade
+de lançamentos verificados.
 
 ## Mensageria
 
@@ -229,32 +250,89 @@ Exemplo:
 curl http://localhost:8081/metrics
 ```
 
+## Migrações
+
+As migrations versionadas ficam em `migrations/`. O serviço `migrate` do
+Compose aplica `up` na subida. Para avançar ou reverter manualmente:
+
+```bash
+docker compose run --rm migrate -path=/migrations -database=postgres://postgres:postgres@postgres:5432/wagerdb?sslmode=disable up
+docker compose run --rm migrate -path=/migrations -database=postgres://postgres:postgres@postgres:5432/wagerdb?sslmode=disable down 1
+```
+
+Cada arquivo `*.up.sql` tem o `*.down.sql` correspondente.
+
+## Múltiplas instâncias e falhas
+
+A coordenação é no PostgreSQL. Três processos na mesma base:
+
+```powershell
+$env:HTTP_ADDR = ":8081"; go run ./cmd/api
+$env:HTTP_ADDR = ":8082"; go run ./cmd/api
+$env:HTTP_ADDR = ":8083"; go run ./cmd/api
+```
+
+Reinício após commit: `docker compose restart api`, ou encerre o
+`go run` com Ctrl+C. O shutdown cancela o consumo SQS, espera os workers
+e fecha o pool. Mensagens não removidas voltam pela visibilidade da fila;
+eventos da outbox e `PENDING_REFERENCE` são retomados por outra instância.
+
+Os testes de recuperação em `internal/worker/recovery_integration_test.go`
+reproduzem commit sem delete, disputa da outbox e retomada de referência.
+
 ## Testes
 
 Testes unitários:
 
 ```bash
+gofmt -l .
 go test ./...
 go vet ./...
 ```
 
-Os testes de integração usam `TEST_DATABASE_URL`. Com o PostgreSQL local:
+O detector de data race do Go exige CGO e um compilador C (`gcc` no `PATH`).
+No Windows, instale MinGW-w64 ou TDM-GCC e defina `CGO_ENABLED=1`. Sem isso,
+`go test -race` falha com `cgo: C compiler "gcc" not found` ou
+`-race requires cgo`.
 
 ```bash
-TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/wagerdb?sslmode=disable" \
-  go test ./... -count=1
+CGO_ENABLED=1 go test -race ./...
 ```
 
 No PowerShell:
 
 ```powershell
+$env:CGO_ENABLED = "1"
+go test -race ./...
+```
+
+Os testes de integração usam `TEST_DATABASE_URL`. Sem essa variável eles são
+ignorados (`Skip`). Com o PostgreSQL local:
+
+```bash
+CGO_ENABLED=1 \
+TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/wagerdb?sslmode=disable" \
+  go test -race ./... -count=1
+```
+
+No PowerShell:
+
+```powershell
+$env:CGO_ENABLED = "1"
 $env:TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:5432/wagerdb?sslmode=disable"
-go test ./... -count=1
+go test -race ./... -count=1
 ```
 
 A suíte cobre concorrência na mesma carteira, replay idempotente, corridas de
 reversão, referências fora de ordem e ausência de divergência entre saldo e
-ledger.
+ledger. Os testes obrigatórios do enunciado executam três instâncias com pools
+PostgreSQL independentes, incluindo duas apostas simultâneas de `80.00` sobre
+`100.00`, 50 reenvios da mesma aposta e carteiras distintas em paralelo.
+
+A recuperação de falhas é exercitada com reentrega SQS após o commit e antes do
+delete, cruzamento HTTP/SQS da mesma operação, retomada de `PENDING_REFERENCE`
+por outra instância, disputa de dois publishers da outbox e republicação com o
+mesmo `eventId` quando o processo cai após o envio e antes da confirmação.
 
 ## Variáveis de ambiente
 

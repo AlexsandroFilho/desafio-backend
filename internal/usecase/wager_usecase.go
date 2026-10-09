@@ -32,6 +32,12 @@ var (
 	ErrRollbackInsufficientBalance = errors.New("insufficient balance to rollback transaction")
 )
 
+const (
+	pendingReferenceMaxAttempts = 10
+	pendingReferenceBaseBackoff = time.Second
+	pendingReferenceMaxBackoff  = time.Hour
+)
+
 type WagerRequest struct {
 	ConsumerName                   string
 	MessageID                      string
@@ -135,6 +141,34 @@ func (uc *WagerUseCase) GetTransactionByID(
 	return transaction, nil
 }
 
+func (uc *WagerUseCase) GetTransactionByExternalID(
+	ctx context.Context,
+	providerID string,
+	externalTransactionID string,
+) (*domain.WagerTransaction, error) {
+	tx, err := uc.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("begin external transaction lookup: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	transaction, err := uc.transactionRepository.GetByProviderAndExternalID(
+		ctx,
+		tx,
+		providerID,
+		externalTransactionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit external transaction lookup: %w", err)
+	}
+	return transaction, nil
+}
+
 func (uc *WagerUseCase) ProcessTransaction(
 	ctx context.Context,
 	req WagerRequest,
@@ -157,6 +191,9 @@ func (uc *WagerUseCase) ProcessTransaction(
 
 	if req.Amount.IsNegative() {
 		return nil, domain.ErrInvalidWalletAmount
+	}
+	if req.Kind == domain.TransactionKindOpening {
+		return nil, ErrUnsupportedWagerKind
 	}
 
 	payloadHash, err := hashWagerRequest(req)
@@ -230,6 +267,9 @@ func (uc *WagerUseCase) ProcessTransaction(
 	)
 	if err != nil {
 		return nil, fmt.Errorf("lock wallet: %w", err)
+	}
+	if wallet.Currency() != req.Amount.Currency() {
+		return nil, domain.ErrCurrencyMismatch
 	}
 
 	transactionID, err := newUUID()
@@ -468,39 +508,62 @@ func (uc *WagerUseCase) ProcessPendingReferences(
 	}
 
 	processed := 0
-	for processed < limit {
-		found, err := uc.processNextPendingReference(ctx)
+	for attempted := 0; attempted < limit; attempted++ {
+		found, finalized, err := uc.processNextPendingReference(ctx)
 		if err != nil {
 			return processed, err
 		}
 		if !found {
 			break
 		}
-		processed++
+		if finalized {
+			processed++
+		}
 	}
 	return processed, nil
 }
 
 func (uc *WagerUseCase) processNextPendingReference(
 	ctx context.Context,
-) (bool, error) {
+) (bool, bool, error) {
 	tx, err := uc.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("begin pending reference transaction: %w", err)
+		return false, false, fmt.Errorf("begin pending reference transaction: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
 
-	txn, err := uc.transactionRepository.GetResolvablePendingReferenceForUpdate(
-		ctx,
-		tx,
-	)
+	txn, retryCount, expiresAt, err :=
+		uc.transactionRepository.GetPendingReferenceForUpdate(
+			ctx,
+			tx,
+		)
 	if errors.Is(err, repository.ErrTransactionNotFound) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("claim pending reference transaction: %w", err)
+		return false, false, fmt.Errorf("claim pending reference transaction: %w", err)
+	}
+
+	_, err = uc.transactionRepository.GetByProviderAndExternalID(
+		ctx,
+		tx,
+		txn.ProviderID(),
+		txn.ReferenceExternalTransactionID(),
+	)
+	if errors.Is(err, repository.ErrTransactionNotFound) {
+		finalized, err := uc.handleMissingPendingReference(
+			ctx,
+			tx,
+			txn,
+			retryCount,
+			expiresAt,
+		)
+		return true, finalized, err
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("check pending reference target: %w", err)
 	}
 
 	wallet, err := uc.walletRepository.GetForUpdate(
@@ -510,7 +573,7 @@ func (uc *WagerUseCase) processNextPendingReference(
 		txn.WalletID(),
 	)
 	if err != nil {
-		return false, fmt.Errorf("lock pending reference wallet: %w", err)
+		return false, false, fmt.Errorf("lock pending reference wallet: %w", err)
 	}
 	reference, err := uc.transactionRepository.GetByProviderAndExternalIDForUpdate(
 		ctx,
@@ -519,10 +582,10 @@ func (uc *WagerUseCase) processNextPendingReference(
 		txn.ReferenceExternalTransactionID(),
 	)
 	if err != nil {
-		return false, fmt.Errorf("lock resolved reference transaction: %w", err)
+		return false, false, fmt.Errorf("lock resolved reference transaction: %w", err)
 	}
 	if err := txn.ResolveReference(reference.ID()); err != nil {
-		return false, fmt.Errorf("resolve pending transaction reference: %w", err)
+		return false, false, fmt.Errorf("resolve pending transaction reference: %w", err)
 	}
 
 	req := requestFromTransaction(txn)
@@ -534,7 +597,7 @@ func (uc *WagerUseCase) processNextPendingReference(
 			reference.ID(),
 		)
 		if err != nil {
-			return false, fmt.Errorf("check pending reference reversal: %w", err)
+			return false, false, fmt.Errorf("check pending reference reversal: %w", err)
 		}
 		if reversed {
 			businessErr = ErrReferenceAlreadyReversed
@@ -547,18 +610,18 @@ func (uc *WagerUseCase) processNextPendingReference(
 		operation, businessErr = applyWalletOperation(wallet, req, reference)
 	}
 	if err := txn.RecordWalletResult(wallet.Balance(), wallet.Version()); err != nil {
-		return false, fmt.Errorf("record pending reference wallet result: %w", err)
+		return false, false, fmt.Errorf("record pending reference wallet result: %w", err)
 	}
 	if businessErr != nil {
 		if err := txn.MarkRejected(failureCodeFor(businessErr)); err != nil {
-			return false, fmt.Errorf("reject pending reference transaction: %w", err)
+			return false, false, fmt.Errorf("reject pending reference transaction: %w", err)
 		}
 		if err := uc.transactionRepository.UpdatePendingReference(
 			ctx,
 			tx,
 			txn,
 		); err != nil {
-			return false, fmt.Errorf("save rejected pending reference: %w", err)
+			return false, false, fmt.Errorf("save rejected pending reference: %w", err)
 		}
 		rejectedEvent, err := event.NewWagerTransactionRejected(
 			txn.ID(),
@@ -567,19 +630,19 @@ func (uc *WagerUseCase) processNextPendingReference(
 			wagerEventData(txn),
 		)
 		if err != nil {
-			return false, fmt.Errorf("create rejected pending reference event: %w", err)
+			return false, false, fmt.Errorf("create rejected pending reference event: %w", err)
 		}
 		if err := uc.inboxOutboxRepository.SaveOutbox(
 			ctx,
 			tx,
 			rejectedEvent,
 		); err != nil {
-			return false, fmt.Errorf("save rejected pending reference event: %w", err)
+			return false, false, fmt.Errorf("save rejected pending reference event: %w", err)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("commit rejected pending reference: %w", err)
+			return false, false, fmt.Errorf("commit rejected pending reference: %w", err)
 		}
-		return true, nil
+		return true, true, nil
 	}
 
 	if operation.balanceChanged {
@@ -589,18 +652,18 @@ func (uc *WagerUseCase) processNextPendingReference(
 			txn.ProviderID(),
 			wallet,
 		); err != nil {
-			return false, fmt.Errorf("update pending reference wallet balance: %w", err)
+			return false, false, fmt.Errorf("update pending reference wallet balance: %w", err)
 		}
 	}
 	if err := txn.MarkProcessed(); err != nil {
-		return false, fmt.Errorf("process pending reference transaction: %w", err)
+		return false, false, fmt.Errorf("process pending reference transaction: %w", err)
 	}
 	if err := uc.transactionRepository.UpdatePendingReference(
 		ctx,
 		tx,
 		txn,
 	); err != nil {
-		return false, fmt.Errorf("save processed pending reference: %w", err)
+		return false, false, fmt.Errorf("save processed pending reference: %w", err)
 	}
 	if operation.balanceChanged {
 		if err := uc.saveLedgerEntry(
@@ -611,7 +674,7 @@ func (uc *WagerUseCase) processNextPendingReference(
 			operation.direction,
 			balanceBefore,
 		); err != nil {
-			return false, err
+			return false, false, err
 		}
 	}
 	if err := uc.saveProcessedEvents(
@@ -623,12 +686,80 @@ func (uc *WagerUseCase) processNextPendingReference(
 		operation.direction,
 		operation.balanceChanged,
 	); err != nil {
-		return false, err
+		return false, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit processed pending reference: %w", err)
+		return false, false, fmt.Errorf("commit processed pending reference: %w", err)
+	}
+	return true, true, nil
+}
+
+func (uc *WagerUseCase) handleMissingPendingReference(
+	ctx context.Context,
+	tx pgx.Tx,
+	txn *domain.WagerTransaction,
+	retryCount int,
+	expiresAt time.Time,
+) (bool, error) {
+	now := time.Now().UTC()
+	nextRetryCount := retryCount + 1
+	if nextRetryCount < pendingReferenceMaxAttempts && now.Before(expiresAt) {
+		nextRetryAt := now.Add(pendingReferenceBackoff(nextRetryCount))
+		if err := uc.transactionRepository.SchedulePendingReferenceRetry(
+			ctx,
+			tx,
+			txn.ID(),
+			nextRetryCount,
+			nextRetryAt,
+		); err != nil {
+			return false, fmt.Errorf("schedule missing reference retry: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit missing reference retry: %w", err)
+		}
+		return false, nil
+	}
+
+	if err := txn.MarkRejected(failureCodeFor(ErrReferenceNotFound)); err != nil {
+		return false, fmt.Errorf("expire pending reference: %w", err)
+	}
+	if err := uc.transactionRepository.UpdatePendingReference(
+		ctx,
+		tx,
+		txn,
+	); err != nil {
+		return false, fmt.Errorf("save expired pending reference: %w", err)
+	}
+	rejectedEvent, err := event.NewWagerTransactionRejected(
+		txn.ID(),
+		txn.CorrelationID(),
+		txn.CausationID(),
+		wagerEventData(txn),
+	)
+	if err != nil {
+		return false, fmt.Errorf("create expired pending reference event: %w", err)
+	}
+	if err := uc.inboxOutboxRepository.SaveOutbox(ctx, tx, rejectedEvent); err != nil {
+		return false, fmt.Errorf("save expired pending reference event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit expired pending reference: %w", err)
 	}
 	return true, nil
+}
+
+func pendingReferenceBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return pendingReferenceBaseBackoff
+	}
+	backoff := pendingReferenceBaseBackoff
+	for current := 1; current < attempt && backoff < pendingReferenceMaxBackoff; current++ {
+		backoff *= 2
+	}
+	if backoff > pendingReferenceMaxBackoff {
+		return pendingReferenceMaxBackoff
+	}
+	return backoff
 }
 
 func requestFromTransaction(txn *domain.WagerTransaction) WagerRequest {

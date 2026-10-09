@@ -47,10 +47,17 @@ type TransactionRepository interface {
 		tx pgx.Tx,
 		referenceTransactionID string,
 	) (bool, error)
-	GetResolvablePendingReferenceForUpdate(
+	GetPendingReferenceForUpdate(
 		ctx context.Context,
 		tx pgx.Tx,
-	) (*domain.WagerTransaction, error)
+	) (*domain.WagerTransaction, int, time.Time, error)
+	SchedulePendingReferenceRetry(
+		ctx context.Context,
+		tx pgx.Tx,
+		transactionID string,
+		retryCount int,
+		nextRetryAt time.Time,
+	) error
 	UpdatePendingReference(
 		ctx context.Context,
 		tx pgx.Tx,
@@ -339,10 +346,10 @@ func (r *PostgresTransactionRepository) HasProcessedReversal(
 	return exists, nil
 }
 
-func (r *PostgresTransactionRepository) GetResolvablePendingReferenceForUpdate(
+func (r *PostgresTransactionRepository) GetPendingReferenceForUpdate(
 	ctx context.Context,
 	tx pgx.Tx,
-) (*domain.WagerTransaction, error) {
+) (*domain.WagerTransaction, int, time.Time, error) {
 	const query = `
 		SELECT
 			pending.id,
@@ -368,21 +375,66 @@ func (r *PostgresTransactionRepository) GetResolvablePendingReferenceForUpdate(
 			pending.created_at,
 			pending.updated_at
 		FROM wager_transactions AS pending
-		JOIN wager_transactions AS original
-		  ON original.provider_id = pending.provider_id
-		 AND original.external_transaction_id =
-		     pending.reference_external_transaction_id
 		WHERE pending.status = 'PENDING_REFERENCE'
-		  AND original.status IN ('PROCESSED', 'REJECTED', 'FAILED')
-		ORDER BY pending.created_at, pending.id
+		  AND pending.reference_next_retry_at <= NOW()
+		ORDER BY pending.reference_next_retry_at, pending.created_at, pending.id
 		FOR UPDATE OF pending SKIP LOCKED
 		LIMIT 1
 	`
 
-	return scanWagerTransaction(
+	transaction, err := scanWagerTransaction(
 		tx.QueryRow(ctx, query),
-		"get resolvable pending reference for update",
+		"get pending reference for update",
 	)
+	if err != nil {
+		return nil, 0, time.Time{}, err
+	}
+
+	var retryCount int
+	var expiresAt time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT reference_retry_count, reference_expires_at
+		FROM wager_transactions
+		WHERE id = $1
+	`, transaction.ID()).Scan(&retryCount, &expiresAt); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf(
+			"get pending reference retry metadata: %w",
+			err,
+		)
+	}
+	return transaction, retryCount, expiresAt, nil
+}
+
+func (r *PostgresTransactionRepository) SchedulePendingReferenceRetry(
+	ctx context.Context,
+	tx pgx.Tx,
+	transactionID string,
+	retryCount int,
+	nextRetryAt time.Time,
+) error {
+	const query = `
+		UPDATE wager_transactions
+		SET reference_retry_count = $1,
+			reference_next_retry_at = $2,
+			updated_at = NOW()
+		WHERE id = $3
+		  AND status = 'PENDING_REFERENCE'
+	`
+
+	commandTag, err := tx.Exec(
+		ctx,
+		query,
+		retryCount,
+		nextRetryAt,
+		transactionID,
+	)
+	if err != nil {
+		return fmt.Errorf("schedule pending reference retry: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return ErrTransactionNotFound
+	}
+	return nil
 }
 
 func (r *PostgresTransactionRepository) UpdatePendingReference(
@@ -395,7 +447,8 @@ func (r *PostgresTransactionRepository) UpdatePendingReference(
 		txn.Status() != domain.TransactionStatusFailed {
 		return domain.ErrInvalidTransactionStatus
 	}
-	if txn.ReferenceTransactionID() == "" {
+	if txn.Status() == domain.TransactionStatusProcessed &&
+		txn.ReferenceTransactionID() == "" {
 		return domain.ErrInvalidReferenceResolution
 	}
 
@@ -414,7 +467,7 @@ func (r *PostgresTransactionRepository) UpdatePendingReference(
 	commandTag, err := tx.Exec(
 		ctx,
 		query,
-		txn.ReferenceTransactionID(),
+		nullIfEmpty(txn.ReferenceTransactionID()),
 		txn.Status(),
 		nullIfEmpty(txn.FailureCode()),
 		txn.ResultBalance().AmountCents(),

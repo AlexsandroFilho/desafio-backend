@@ -180,6 +180,7 @@ func provideWalletApplication(
 	transactionRepository repository.TransactionRepository,
 	ledgerRepository repository.LedgerRepository,
 	inboxOutboxRepository repository.InboxOutboxRepository,
+	metrics *observability.Metrics,
 ) handler.WalletApplication {
 	return usecase.NewWalletUseCase(
 		db,
@@ -187,6 +188,7 @@ func provideWalletApplication(
 		transactionRepository,
 		ledgerRepository,
 		inboxOutboxRepository,
+		metrics,
 	)
 }
 
@@ -222,6 +224,7 @@ func provideHTTPServer(
 	rootMux.Handle("/wallets", auth.Authenticate(protectedMux))
 	rootMux.Handle("/wallets/", auth.Authenticate(protectedMux))
 	rootMux.Handle("/wagering/", auth.Authenticate(protectedMux))
+	rootMux.Handle("/providers/", auth.Authenticate(protectedMux))
 
 	return &http.Server{
 		Addr:              config.HTTPAddress,

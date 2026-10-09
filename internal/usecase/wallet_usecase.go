@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 
 	"alexsandro-filho/desafio-backend/internal/domain"
 	"alexsandro-filho/desafio-backend/internal/event"
@@ -20,9 +21,16 @@ type CreateWalletCommand struct {
 }
 
 type WalletReconciliation struct {
-	StoredBalance domain.Money
-	LedgerBalance domain.Money
-	Matches       bool
+	WalletID          string
+	StoredBalance     domain.Money
+	CalculatedBalance domain.Money
+	Difference        domain.Money
+	Consistent        bool
+	CheckedEntries    int
+}
+
+type ReconciliationObserver interface {
+	ObserveReconciliation(consistent bool)
 }
 
 type WalletUseCase struct {
@@ -31,6 +39,7 @@ type WalletUseCase struct {
 	transactionRepository repository.TransactionRepository
 	ledgerRepository      repository.LedgerRepository
 	inboxOutboxRepository repository.InboxOutboxRepository
+	observer              ReconciliationObserver
 }
 
 func NewWalletUseCase(
@@ -39,14 +48,19 @@ func NewWalletUseCase(
 	transactionRepository repository.TransactionRepository,
 	ledgerRepository repository.LedgerRepository,
 	inboxOutboxRepository repository.InboxOutboxRepository,
+	observers ...ReconciliationObserver,
 ) *WalletUseCase {
-	return &WalletUseCase{
+	useCase := &WalletUseCase{
 		db:                    db,
 		walletRepository:      walletRepository,
 		transactionRepository: transactionRepository,
 		ledgerRepository:      ledgerRepository,
 		inboxOutboxRepository: inboxOutboxRepository,
 	}
+	if len(observers) > 0 {
+		useCase.observer = observers[0]
+	}
+	return useCase
 }
 
 func (uc *WalletUseCase) CreateWallet(
@@ -79,8 +93,10 @@ func (uc *WalletUseCase) CreateWallet(
 	if err := uc.walletRepository.Create(ctx, tx, providerID, wallet); err != nil {
 		return nil, err
 	}
-	if err := uc.createOpeningRecords(ctx, tx, providerID, wallet); err != nil {
-		return nil, err
+	if !wallet.Balance().IsZero() {
+		if err := uc.createOpeningRecords(ctx, tx, providerID, wallet); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit wallet creation: %w", err)
@@ -94,7 +110,7 @@ func (uc *WalletUseCase) GetWallet(
 	providerID string,
 	walletID string,
 ) (*domain.Wallet, error) {
-	tx, err := uc.db.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := uc.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, fmt.Errorf("begin wallet lookup: %w", err)
 	}
@@ -102,7 +118,7 @@ func (uc *WalletUseCase) GetWallet(
 		_ = tx.Rollback(ctx)
 	}()
 
-	wallet, err := uc.walletRepository.GetForUpdate(
+	wallet, err := uc.walletRepository.Get(
 		ctx,
 		tx,
 		providerID,
@@ -143,21 +159,63 @@ func (uc *WalletUseCase) ReconcileWallet(
 	providerID string,
 	walletID string,
 ) (*WalletReconciliation, error) {
-	wallet, err := uc.GetWallet(ctx, providerID, walletID)
+	tx, err := uc.db.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("begin wallet reconciliation: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	wallet, err := uc.walletRepository.Get(ctx, tx, providerID, walletID)
 	if err != nil {
 		return nil, err
 	}
 
-	ledgerBalance, err := uc.calculateLedgerBalance(ctx, providerID, wallet)
+	ledgerBalance, checkedEntries, err := uc.calculateLedgerBalance(
+		ctx,
+		tx,
+		providerID,
+		wallet,
+	)
 	if err != nil {
 		return nil, err
 	}
+	difference, err := wallet.Balance().Subtract(ledgerBalance)
+	if err != nil {
+		return nil, fmt.Errorf("calculate reconciliation difference: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit wallet reconciliation: %w", err)
+	}
 
-	return &WalletReconciliation{
-		StoredBalance: wallet.Balance(),
-		LedgerBalance: ledgerBalance,
-		Matches:       wallet.Balance() == ledgerBalance,
-	}, nil
+	result := &WalletReconciliation{
+		WalletID:          wallet.ID(),
+		StoredBalance:     wallet.Balance(),
+		CalculatedBalance: ledgerBalance,
+		Difference:        difference,
+		Consistent:        difference.IsZero(),
+		CheckedEntries:    checkedEntries,
+	}
+	if uc.observer != nil {
+		uc.observer.ObserveReconciliation(result.Consistent)
+	}
+	if !result.Consistent {
+		slog.Error(
+			"wallet reconciliation divergence detected",
+			"provider_id", providerID,
+			"wallet_id", wallet.ID(),
+			"stored_balance", result.StoredBalance.StringFormat(),
+			"calculated_balance", result.CalculatedBalance.StringFormat(),
+			"difference", result.Difference.StringFormat(),
+			"currency", result.StoredBalance.Currency(),
+			"checked_entries", result.CheckedEntries,
+		)
+	}
+	return result, nil
 }
 
 func (uc *WalletUseCase) createOpeningRecords(
@@ -266,44 +324,47 @@ func (uc *WalletUseCase) createOpeningRecords(
 
 func (uc *WalletUseCase) calculateLedgerBalance(
 	ctx context.Context,
+	db repository.DBExecutor,
 	providerID string,
 	wallet *domain.Wallet,
-) (domain.Money, error) {
+) (domain.Money, int, error) {
 	total, err := domain.NewMoneyFromString("0.00", wallet.Currency())
 	if err != nil {
-		return domain.Money{}, err
+		return domain.Money{}, 0, err
 	}
 
 	cursor := ""
+	checkedEntries := 0
 	for {
 		entries, nextCursor, err := uc.ledgerRepository.GetEntriesByWalletID(
 			ctx,
-			uc.db,
+			db,
 			providerID,
 			wallet.ID(),
 			cursor,
 			100,
 		)
 		if err != nil {
-			return domain.Money{}, err
+			return domain.Money{}, 0, err
 		}
 
 		for _, entry := range entries {
+			checkedEntries++
 			switch entry.Direction() {
 			case domain.LedgerDirectionCredit:
 				total, err = total.Add(entry.Amount())
 			case domain.LedgerDirectionDebit:
 				total, err = total.Subtract(entry.Amount())
 			default:
-				return domain.Money{}, domain.ErrInvalidLedgerDirection
+				return domain.Money{}, 0, domain.ErrInvalidLedgerDirection
 			}
 			if err != nil {
-				return domain.Money{}, err
+				return domain.Money{}, 0, err
 			}
 		}
 
 		if nextCursor == "" {
-			return total, nil
+			return total, checkedEntries, nil
 		}
 		cursor = nextCursor
 	}

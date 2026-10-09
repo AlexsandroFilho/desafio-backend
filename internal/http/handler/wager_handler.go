@@ -25,6 +25,11 @@ type TransactionReader interface {
 		providerID string,
 		transactionID string,
 	) (*domain.WagerTransaction, error)
+	GetTransactionByExternalID(
+		ctx context.Context,
+		providerID string,
+		externalTransactionID string,
+	) (*domain.WagerTransaction, error)
 }
 
 type WagerHandler struct {
@@ -57,6 +62,10 @@ func NewWagerHandler(
 func (h *WagerHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /wagering/transactions", h.Process)
 	mux.HandleFunc("GET /wagering/transactions/{transactionId}", h.Get)
+	mux.HandleFunc(
+		"GET /providers/{providerId}/wagering/transactions/{externalTransactionId}",
+		h.GetByExternalID,
+	)
 }
 
 func (h *WagerHandler) Process(w http.ResponseWriter, r *http.Request) {
@@ -156,8 +165,36 @@ func (h *WagerHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, wagerResponseFromDomain(transaction))
 }
 
+func (h *WagerHandler) GetByExternalID(w http.ResponseWriter, r *http.Request) {
+	providerID, ok := requireProviderID(w, r)
+	if !ok {
+		return
+	}
+	if r.PathValue("providerId") != providerID {
+		writeError(
+			w,
+			http.StatusForbidden,
+			"PROVIDER_MISMATCH",
+			"providerId does not match authenticated provider",
+		)
+		return
+	}
+
+	transaction, err := h.reader.GetTransactionByExternalID(
+		r.Context(),
+		providerID,
+		r.PathValue("externalTransactionId"),
+	)
+	if err != nil {
+		writeWagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, wagerResponseFromDomain(transaction))
+}
+
 type wagerHTTPResponse struct {
 	ID                             string                   `json:"id"`
+	TransactionID                  string                   `json:"transactionId"`
 	ProviderID                     string                   `json:"providerId"`
 	ExternalTransactionID          string                   `json:"externalTransactionId"`
 	WalletID                       string                   `json:"walletId"`
@@ -179,6 +216,7 @@ type wagerHTTPResponse struct {
 func wagerResponseFromUseCase(response *usecase.WagerResponse) wagerHTTPResponse {
 	return wagerHTTPResponse{
 		ID:                             response.TransactionID,
+		TransactionID:                  response.TransactionID,
 		ProviderID:                     response.ProviderID,
 		ExternalTransactionID:          response.ExternalID,
 		WalletID:                       response.WalletID,
@@ -202,6 +240,7 @@ func wagerResponseFromDomain(transaction *domain.WagerTransaction) wagerHTTPResp
 
 	return wagerHTTPResponse{
 		ID:                             transaction.ID(),
+		TransactionID:                  transaction.ID(),
 		ProviderID:                     transaction.ProviderID(),
 		ExternalTransactionID:          transaction.ExternalTransactionID(),
 		WalletID:                       transaction.WalletID(),
@@ -231,8 +270,10 @@ func writeWagerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "WALLET_NOT_FOUND", err.Error())
 	case errors.Is(err, domain.ErrInvalidAmount),
 		errors.Is(err, domain.ErrInvalidCurrency),
+		errors.Is(err, domain.ErrCurrencyMismatch),
 		errors.Is(err, domain.ErrInvalidTransactionKind),
-		errors.Is(err, domain.ErrInvalidWalletAmount):
+		errors.Is(err, domain.ErrInvalidWalletAmount),
+		errors.Is(err, usecase.ErrUnsupportedWagerKind):
 		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 	case isServiceUnavailable(err):
 		writeError(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "service temporarily unavailable")

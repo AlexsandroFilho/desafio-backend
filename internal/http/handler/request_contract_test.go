@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"alexsandro-filho/desafio-backend/internal/domain"
+	"alexsandro-filho/desafio-backend/internal/usecase"
 )
 
 func TestCreateWalletRequestUsesNestedMoneyAndGeneratedID(t *testing.T) {
@@ -73,6 +77,34 @@ func TestWagerRequestUsesProviderAndNestedMoney(t *testing.T) {
 	}`
 	if err := decodeContractBody(legacy, &processWagerRequest{}); err == nil {
 		t.Fatal("legacy wager request contract was accepted")
+	}
+}
+
+func TestWagerResponseIncludesOfficialTransactionID(t *testing.T) {
+	amount, err := domain.NewMoneyFromString("975.00", "BRL")
+	if err != nil {
+		t.Fatalf("money: %v", err)
+	}
+	encoded, err := json.Marshal(wagerResponseFromUseCase(&usecase.WagerResponse{
+		TransactionID:    "0192f298-345e-7e38-af88-e43f851a819d",
+		Status:           domain.TransactionStatusProcessed,
+		Amount:           amount,
+		Balance:          amount,
+		IdempotentReplay: false,
+	}))
+	if err != nil {
+		t.Fatalf("marshal wager response: %v", err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		t.Fatalf("unmarshal wager response: %v", err)
+	}
+	if body["transactionId"] != "0192f298-345e-7e38-af88-e43f851a819d" {
+		t.Fatalf("transactionId = %v, want official contract field", body["transactionId"])
+	}
+	if body["idempotentReplay"] != false {
+		t.Fatalf("idempotentReplay = %v, want false", body["idempotentReplay"])
 	}
 }
 

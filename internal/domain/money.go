@@ -12,6 +12,10 @@ type Money struct {
 	currency string
 }
 
+func ZeroMoney(currency string) (Money, error) {
+	return NewMoneyFromString("0.00", currency)
+}
+
 func NewMoneyFromString(amountStr, currency string) (Money, error) {
 	if !isCurrencyCode(currency) {
 		return Money{}, ErrInvalidCurrency
@@ -81,6 +85,27 @@ func (m Money) IsZero() bool {
 
 func (m Money) IsNegative() bool {
 	return m.amount < 0
+}
+
+func (m Money) Equal(other Money) (bool, error) {
+	if m.currency != other.currency {
+		return false, ErrCurrencyMismatch
+	}
+	return m.amount == other.amount, nil
+}
+
+func (m Money) Compare(other Money) (int, error) {
+	if m.currency != other.currency {
+		return 0, ErrCurrencyMismatch
+	}
+	switch {
+	case m.amount < other.amount:
+		return -1, nil
+	case m.amount > other.amount:
+		return 1, nil
+	default:
+		return 0, nil
+	}
 }
 
 func parseAmountCents(amount string) (int64, error) {

@@ -48,33 +48,44 @@ func TestPendingReferenceIsProcessedAfterOriginalArrivesIntegration(t *testing.T
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `
+		cleanupTx, beginErr := pool.Begin(cleanupCtx)
+		if beginErr != nil {
+			return
+		}
+		defer func() { _ = cleanupTx.Rollback(cleanupCtx) }()
+		_, _ = cleanupTx.Exec(
+			cleanupCtx,
+			`SET LOCAL app.allow_ledger_maintenance = 'on'`,
+		)
+		_, _ = cleanupTx.Exec(cleanupCtx, `
 			DELETE FROM outbox
-			WHERE aggregate_id IN (
-				SELECT id FROM wager_transactions WHERE provider_id = $1
+			WHERE aggregate_id = $1
+			   OR aggregate_id IN (
+				SELECT id FROM wager_transactions WHERE provider_id = $2
 			)
-		`, providerID)
-		_, _ = pool.Exec(cleanupCtx, `
+		`, walletID, providerID)
+		_, _ = cleanupTx.Exec(cleanupCtx, `
 			DELETE FROM wallet_ledger_entries
 			WHERE transaction_id IN (
 				SELECT id FROM wager_transactions WHERE provider_id = $1
 			)
 		`, providerID)
-		_, _ = pool.Exec(
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
 			`DELETE FROM wager_idempotency_keys WHERE provider_id = $1`,
 			providerID,
 		)
-		_, _ = pool.Exec(
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
 			`DELETE FROM wager_transactions WHERE provider_id = $1`,
 			providerID,
 		)
-		_, _ = pool.Exec(
+		_, _ = cleanupTx.Exec(
 			cleanupCtx,
 			`DELETE FROM wallets WHERE id = $1`,
 			walletID,
 		)
+		_ = cleanupTx.Commit(cleanupCtx)
 	})
 
 	walletRepository := repository.NewPostgresWalletRepository()
@@ -171,6 +182,31 @@ func TestPendingReferenceIsProcessedAfterOriginalArrivesIntegration(t *testing.T
 	}
 	if betResponse.Status != domain.TransactionStatusProcessed {
 		t.Fatalf("bet status = %s, want PROCESSED", betResponse.Status)
+	}
+	byExternalID, err := uc.GetTransactionByExternalID(
+		ctx,
+		providerID,
+		betRequest.ExternalTransactionID,
+	)
+	if err != nil {
+		t.Fatalf("GetTransactionByExternalID() error = %v", err)
+	}
+	if byExternalID.ID() != betResponse.TransactionID {
+		t.Errorf(
+			"external lookup transaction ID = %s, want %s",
+			byExternalID.ID(),
+			betResponse.TransactionID,
+		)
+	}
+	if _, err := uc.GetTransactionByExternalID(
+		ctx,
+		otherProviderID,
+		betRequest.ExternalTransactionID,
+	); !errors.Is(err, repository.ErrTransactionNotFound) {
+		t.Errorf(
+			"cross-provider external lookup error = %v, want transaction not found",
+			err,
+		)
 	}
 	if _, err := uc.GetTransactionByID(
 		ctx,
@@ -305,5 +341,90 @@ func TestPendingReferenceIsProcessedAfterOriginalArrivesIntegration(t *testing.T
 	}
 	if balance != 10500 {
 		t.Errorf("wallet balance after replay = %d, want 10500", balance)
+	}
+
+	expiringResponse, err := uc.ProcessTransaction(ctx, WagerRequest{
+		ProviderID:                     providerID,
+		ExternalTransactionID:          "expiring-refund-" + suffix,
+		IdempotencyKey:                 "expiring-refund-key-" + suffix,
+		WalletID:                       walletID,
+		PlayerID:                       playerID,
+		RoundID:                        "expiring-round-" + suffix,
+		GameID:                         "game-1",
+		Kind:                           domain.TransactionKindRefund,
+		Amount:                         mustMoney(t, "3.00"),
+		ReferenceExternalTransactionID: "never-arrives-" + suffix,
+	})
+	if err != nil {
+		t.Fatalf("create expiring pending reference: %v", err)
+	}
+	if expiringResponse.Status != domain.TransactionStatusPendingReference {
+		t.Fatalf(
+			"expiring reference status = %s, want PENDING_REFERENCE",
+			expiringResponse.Status,
+		)
+	}
+
+	processed, err = uc.ProcessPendingReferences(ctx, 10)
+	if err != nil {
+		t.Fatalf("schedule pending reference retry: %v", err)
+	}
+	if processed != 0 {
+		t.Fatalf("finalized pending references = %d, want 0", processed)
+	}
+
+	var (
+		retryCount  int
+		nextRetryAt time.Time
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT reference_retry_count, reference_next_retry_at
+		FROM wager_transactions
+		WHERE id = $1
+	`, expiringResponse.TransactionID).Scan(
+		&retryCount,
+		&nextRetryAt,
+	); err != nil {
+		t.Fatalf("query pending reference retry: %v", err)
+	}
+	if retryCount != 1 || !nextRetryAt.After(time.Now().UTC()) {
+		t.Errorf(
+			"pending retry = count %d next %s, want count 1 in the future",
+			retryCount,
+			nextRetryAt,
+		)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE wager_transactions
+		SET reference_retry_count = $1,
+			reference_next_retry_at = NOW()
+		WHERE id = $2
+	`, pendingReferenceMaxAttempts-1, expiringResponse.TransactionID); err != nil {
+		t.Fatalf("prepare pending reference expiration: %v", err)
+	}
+	processed, err = uc.ProcessPendingReferences(ctx, 10)
+	if err != nil {
+		t.Fatalf("expire pending reference: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("expired pending references = %d, want 1", processed)
+	}
+
+	expired, err := uc.GetTransactionByID(
+		ctx,
+		providerID,
+		expiringResponse.TransactionID,
+	)
+	if err != nil {
+		t.Fatalf("GetTransactionByID(expired) error = %v", err)
+	}
+	if expired.Status() != domain.TransactionStatusRejected ||
+		expired.FailureCode() != "REFERENCE_NOT_FOUND" {
+		t.Errorf(
+			"expired reference = status %s failure %q, want REJECTED REFERENCE_NOT_FOUND",
+			expired.Status(),
+			expired.FailureCode(),
+		)
 	}
 }

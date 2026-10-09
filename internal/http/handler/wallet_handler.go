@@ -174,9 +174,12 @@ func (h *WalletHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"storedBalance": moneyResponseFromDomain(result.StoredBalance),
-		"ledgerBalance": moneyResponseFromDomain(result.LedgerBalance),
-		"matches":       result.Matches,
+		"walletId":          result.WalletID,
+		"storedBalance":     moneyResponseFromDomain(result.StoredBalance),
+		"calculatedBalance": moneyResponseFromDomain(result.CalculatedBalance),
+		"difference":        moneyResponseFromDomain(result.Difference),
+		"consistent":        result.Consistent,
+		"checkedEntries":    result.CheckedEntries,
 	})
 }
 
@@ -243,6 +246,8 @@ func writeWalletError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, repository.ErrWalletNotFound):
 		writeError(w, http.StatusNotFound, "WALLET_NOT_FOUND", err.Error())
+	case errors.Is(err, repository.ErrWalletAlreadyExists):
+		writeError(w, http.StatusConflict, "WALLET_ALREADY_EXISTS", err.Error())
 	case errors.Is(err, repository.ErrWalletUpdateConflict):
 		writeError(w, http.StatusConflict, "WALLET_CONFLICT", err.Error())
 	case errors.Is(err, repository.ErrInvalidLedgerCursor),

@@ -27,6 +27,7 @@ type Metrics struct {
 	outboxPending     prometheus.Gauge
 	pendingCycles     *prometheus.CounterVec
 	pendingResolved   prometheus.Counter
+	reconciliations   *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -95,6 +96,12 @@ func NewMetrics() *Metrics {
 			Name:      "resolved_total",
 			Help:      "Total number of pending references resolved.",
 		}),
+		reconciliations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "wager",
+			Subsystem: "reconciliation",
+			Name:      "checks_total",
+			Help:      "Total wallet reconciliation checks by result.",
+		}, []string{"result"}),
 	}
 
 	registry.MustRegister(
@@ -108,6 +115,7 @@ func NewMetrics() *Metrics {
 		metrics.outboxPending,
 		metrics.pendingCycles,
 		metrics.pendingResolved,
+		metrics.reconciliations,
 		prometheus.NewGoCollector(),
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
@@ -152,6 +160,14 @@ func (m *Metrics) ObservePendingReferences(outcome string, count int) {
 		return
 	}
 	m.pendingCycles.WithLabelValues(outcome).Inc()
+}
+
+func (m *Metrics) ObserveReconciliation(consistent bool) {
+	result := "consistent"
+	if !consistent {
+		result = "divergent"
+	}
+	m.reconciliations.WithLabelValues(result).Inc()
 }
 
 func (m *Metrics) HTTPMiddleware(

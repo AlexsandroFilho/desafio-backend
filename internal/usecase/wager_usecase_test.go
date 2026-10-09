@@ -3,9 +3,33 @@ package usecase
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"alexsandro-filho/desafio-backend/internal/domain"
 )
+
+func TestPendingReferenceBackoff(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 0, want: time.Second},
+		{attempt: 1, want: time.Second},
+		{attempt: 2, want: 2 * time.Second},
+		{attempt: 6, want: 32 * time.Second},
+		{attempt: 20, want: time.Hour},
+	}
+	for _, test := range tests {
+		if got := pendingReferenceBackoff(test.attempt); got != test.want {
+			t.Errorf(
+				"pendingReferenceBackoff(%d) = %s, want %s",
+				test.attempt,
+				got,
+				test.want,
+			)
+		}
+	}
+}
 
 func TestApplyWalletOperationLossDoesNotChangeWallet(t *testing.T) {
 	wallet := mustWallet(t, "100.00")

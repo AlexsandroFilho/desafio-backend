@@ -34,6 +34,7 @@ func TestMetricsExposeApplicationAndHTTPMeasurements(t *testing.T) {
 	metrics.ObserveOutboxEvent("published")
 	metrics.SetOutboxPending(3)
 	metrics.ObservePendingReferences("resolved", 2)
+	metrics.ObserveReconciliation(false)
 
 	metricsResponse := httptest.NewRecorder()
 	metrics.Handler().ServeHTTP(
@@ -50,6 +51,7 @@ func TestMetricsExposeApplicationAndHTTPMeasurements(t *testing.T) {
 		`wager_outbox_pending_events 3`,
 		`wager_pending_references_cycles_total{outcome="processed"} 1`,
 		`wager_pending_references_resolved_total 2`,
+		`wager_reconciliation_checks_total{result="divergent"} 1`,
 	}
 	for _, expected := range expectedMetrics {
 		if !strings.Contains(body, expected) {

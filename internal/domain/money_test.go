@@ -110,6 +110,32 @@ func TestMoneyArithmetic(t *testing.T) {
 	}
 }
 
+func TestZeroMoneyAndCompare(t *testing.T) {
+	zero, err := ZeroMoney("BRL")
+	if err != nil {
+		t.Fatalf("ZeroMoney() unexpected error: %v", err)
+	}
+	if !zero.IsZero() || zero.Currency() != "BRL" {
+		t.Fatalf("ZeroMoney() = %+v, want zero BRL", zero)
+	}
+
+	smaller := mustMoney(t, "10.00", "BRL")
+	larger := mustMoney(t, "25.00", "BRL")
+	usd := mustMoney(t, "10.00", "USD")
+
+	equal, err := smaller.Equal(mustMoney(t, "10.00", "BRL"))
+	if err != nil || !equal {
+		t.Fatalf("Equal() = %v, %v, want true", equal, err)
+	}
+	comparison, err := smaller.Compare(larger)
+	if err != nil || comparison >= 0 {
+		t.Fatalf("Compare() = %d, %v, want negative", comparison, err)
+	}
+	if _, err := smaller.Compare(usd); !errors.Is(err, ErrCurrencyMismatch) {
+		t.Fatalf("Compare() error = %v, want %v", err, ErrCurrencyMismatch)
+	}
+}
+
 func TestMoneyArithmeticRejectsCurrencyMismatch(t *testing.T) {
 	brl := mustMoney(t, "25.00", "BRL")
 	usd := mustMoney(t, "10.00", "USD")

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -39,6 +40,28 @@ func TestDecodeWagerEnvelopeOfficialContract(t *testing.T) {
 		envelope.Data.Money.Amount != "25.00" ||
 		envelope.Data.Money.Currency != "BRL" {
 		t.Fatalf("decoded envelope does not match official contract: %+v", envelope)
+	}
+}
+
+func TestInvalidWagerMessageIsLeftForRedrive(t *testing.T) {
+	consumer := NewSQSConsumer(nil, &recordingWagerProcessor{}, "queue-url")
+	if consumer.processMessage(context.Background(), `{"messageId":"bad"}`) {
+		t.Fatal("invalid SQS message must not be acknowledged or deleted")
+	}
+}
+
+func TestSQSConsumerTreatsInvalidFinancialInputAsPermanent(t *testing.T) {
+	permanentErrors := []error{
+		domain.ErrCurrencyMismatch,
+		usecase.ErrUnsupportedWagerKind,
+	}
+	for _, err := range permanentErrors {
+		if !isPermanentWagerError(err) {
+			t.Errorf("isPermanentWagerError(%v) = false, want true", err)
+		}
+	}
+	if isPermanentWagerError(errors.New("temporary infrastructure failure")) {
+		t.Error("temporary infrastructure error was classified as permanent")
 	}
 }
 
